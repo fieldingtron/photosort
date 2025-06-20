@@ -24,6 +24,9 @@ Usage:
     python compare_images.py /path/to/image_directory [--hash phash|ahash|dhash|whash] [--threshold 5]
 """
 
+import warnings
+warnings.filterwarnings("ignore", message="resource_tracker: There appear to be .* leaked semaphore objects")
+
 import os
 import time
 from pathlib import Path
@@ -82,7 +85,7 @@ def save_hash_cache(directory, hash_name, cache):
     with open(cache_path, 'wb') as f:
         pickle.dump(cache, f)
 
-def show_group_interactive(group, group_id, reviewed_cache, deleted_cache):
+def show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=False):
     import matplotlib.widgets as mwidgets
     import numpy as np
     from matplotlib import pyplot as plt
@@ -142,15 +145,20 @@ def show_group_interactive(group, group_id, reviewed_cache, deleted_cache):
     result = {'action': None, 'target': None}
     button_refs = []
     keep_callbacks = []
+    action_taken = [False]  # Use list for mutability in closure
     def make_keep_callback(idx):
         def callback(event=None):
-            result['action'] = 'keep_one'
-            result['target'] = group[idx][0]
-            plt.close(fig)
+            if not action_taken[0]:
+                result['action'] = 'keep_one'
+                result['target'] = group[idx][0]
+                action_taken[0] = True
+                plt.close(fig)
         return callback
     def delete_all_callback(event=None):
-        result['action'] = 'delete_all'
-        plt.close(fig)
+        if not action_taken[0]:
+            result['action'] = 'delete_all'
+            action_taken[0] = True
+            plt.close(fig)
     # Display images and keep buttons
     for i, (img_path, _) in enumerate(group):
         img = Image.open(img_path)
@@ -178,20 +186,26 @@ def show_group_interactive(group, group_id, reviewed_cache, deleted_cache):
     # Preselect the leftmost 'Keep' button and bind Return/Enter, Left, Right, Down to actions
     def on_key(event):
         if event.key in ('enter', 'return', 'left'):
-            keep_callbacks[0]()  # Leftmost keep
+            keep_callbacks[0]()
         elif event.key == 'right':
-            keep_callbacks[-1]()  # Rightmost keep
+            keep_callbacks[-1]()
         elif event.key == 'down':
-            delete_all_callback()  # Delete all
+            delete_all_callback()
     fig.canvas.mpl_connect('key_press_event', on_key)
-    # Visually highlight the leftmost button (optional, for clarity)
-    try:
-        button_refs[0].color = 'yellowgreen'
-        button_refs[0].hovercolor = 'lime'
-        button_refs[0].label.set_fontweight('bold')
-    except Exception:
-        pass
+    # Auto-approve leftmost after 7 seconds if --auto is set, using matplotlib timer
+    def auto_approve(event=None):
+        if not action_taken[0]:
+            keep_callbacks[0]()
+    if auto:
+        timer = fig.canvas.new_timer(interval=7000)
+        timer.add_callback(auto_approve)
+        timer.start()
     plt.show()
+    if auto:
+        try:
+            timer.stop()
+        except Exception:
+            pass
     reviewed_cache.add(group_id)
     save_pickle_cache(REVIEWED_CACHE, reviewed_cache)
     return result
@@ -207,6 +221,7 @@ def main():
                         help="Hash function to use (default: phash)")
     parser.add_argument("--threshold", type=int, default=5,
                         help="Hamming distance threshold for similarity (default: 5)")
+    parser.add_argument("--auto", action="store_true", help="Automatically approve leftmost image after 7 seconds of no response")
     args = parser.parse_args()
     hash_methods = {
         'phash': imagehash.phash,
@@ -279,13 +294,24 @@ def main():
     if len(ungrouped_imgs) > 1:
         print(f"Grouping {len(ungrouped_imgs)} new/ungrouped images (this may take a while)...")
         ungrouped_hashes = [(img, h) for img, h in hashes if img in ungrouped_imgs]
+        # Step 1: Build a hash-to-image index for ungrouped images
+        hash_to_images = {}
+        for img_path, h in hashes:
+            if img_path in ungrouped_imgs:
+                # Use the hash's string representation for dict key
+                h_str = str(h)
+                if h_str not in hash_to_images:
+                    hash_to_images[h_str] = []
+                hash_to_images[h_str].append((img_path, h))
         for i, (img1, hash1) in enumerate(tqdm(ungrouped_hashes, desc="Grouping images", unit="img")):
             if img1 in visited:
                 continue
             group = [(img1, hash1)]
-            for j, (img2, hash2) in enumerate(tqdm(ungrouped_hashes, desc=f"Comparing to {os.path.basename(img1)}", unit="cmp", leave=False)):
-                if i != j and img2 not in visited:
-                    if hash1 - hash2 <= args.threshold:
+            h_str = str(hash1)
+            # Check if hash matches any existing group
+            if h_str in hash_to_images:
+                for img2, hash2 in hash_to_images[h_str]:
+                    if img2 not in visited and img2 != img1:
                         group.append((img2, hash2))
                         visited.add(img2)
             if len(group) > 1:
@@ -304,7 +330,7 @@ def main():
         group_id = tuple(sorted(img for img, _ in group))
         if group_id in reviewed_cache:
             continue  # Already reviewed this group
-        result = show_group_interactive(group, group_id, reviewed_cache, deleted_cache)
+        result = show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=args.auto)
         if result['action'] == 'keep_one':
             for img_path, _ in group:
                 if img_path != result['target']:
