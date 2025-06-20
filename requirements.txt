@@ -1,0 +1,12 @@
+# Unified requirements for all photo management and Immich upload Python scripts
+pillow
+pillow-heif
+matplotlib
+tqdm
+imagehash
+piexif
+# For DNG to HEIC conversion (if needed)
+rawpy
+# For EXIF restore from Google Takeout
+# jq (external, not a Python package)
+# For Immich CLI interaction (external, not a Python package)
