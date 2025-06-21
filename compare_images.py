@@ -24,6 +24,57 @@ Usage:
     python compare_images.py /path/to/image_directory [--hash phash|ahash|dhash|whash] [--threshold 5]
 """
 
+# Auto-activate virtual environment if not already active
+import sys
+import os
+from pathlib import Path
+
+def auto_activate_venv():
+    """Automatically activate virtual environment if not already active"""
+    # Check if we're already in a virtual environment
+    if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+        return  # Already in a virtual environment
+    
+    # Look for venv in current directory or parent directories
+    current_dir = Path(__file__).parent
+    venv_paths_to_try = [
+        current_dir / "venv",
+        current_dir / ".venv",
+        current_dir.parent / "venv",
+        current_dir.parent / ".venv"
+    ]
+    
+    for venv_path in venv_paths_to_try:
+        if venv_path.exists():
+            # Determine the activation script path based on OS
+            if os.name == 'nt':  # Windows
+                activate_script = venv_path / "Scripts" / "activate.bat"
+                python_exe = venv_path / "Scripts" / "python.exe"
+            else:  # Unix/Linux/macOS
+                activate_script = venv_path / "bin" / "activate"
+                python_exe = venv_path / "bin" / "python"
+            
+            if python_exe.exists():
+                # Re-execute the script with the virtual environment Python
+                import subprocess
+                print(f"🐍 Activating virtual environment: {venv_path}")
+                try:
+                    # Pass all original arguments to the venv Python
+                    result = subprocess.run([str(python_exe)] + sys.argv, check=True)
+                    sys.exit(result.returncode)
+                except subprocess.CalledProcessError as e:
+                    sys.exit(e.returncode)
+                except KeyboardInterrupt:
+                    sys.exit(1)
+    
+    # If no venv found, continue with system Python but warn user
+    print("⚠️  No virtual environment found. Make sure required packages are installed:")
+    print("   pip install pillow pillow-heif matplotlib imagehash tqdm")
+    print()
+
+# Try to activate venv before importing other modules
+auto_activate_venv()
+
 import warnings
 warnings.filterwarnings("ignore", message="resource_tracker: There appear to be .* leaked semaphore objects")
 
@@ -37,6 +88,8 @@ import argparse
 import pickle
 from tqdm import tqdm
 import hashlib
+import stat
+import glob
 
 try:
     import pillow_heif
@@ -67,8 +120,21 @@ def load_pickle_cache(path):
     return set()
 
 def save_pickle_cache(path, cache):
-    with open(path, 'wb') as f:
-        pickle.dump(cache, f)
+    try:
+        with open(path, 'wb') as f:
+            pickle.dump(cache, f)
+    except PermissionError:
+        print(f"⚠️  Warning: Cannot write to {path} (permission denied)")
+        # Try to save to a temp directory or user's home directory
+        fallback_path = Path.home() / f".photosort_cache_{Path(path).name}"
+        try:
+            with open(fallback_path, 'wb') as f:
+                pickle.dump(cache, f)
+            print(f"📁 Cache saved to fallback location: {fallback_path}")
+        except Exception as e:
+            print(f"❌ Failed to save cache to fallback location: {e}")
+    except Exception as e:
+        print(f"❌ Error saving cache to {path}: {e}")
 
 def load_hash_cache(directory, hash_name):
     cache_path = Path(directory) / f'.hash_cache_{hash_name}.pkl'
@@ -82,8 +148,19 @@ def load_hash_cache(directory, hash_name):
 
 def save_hash_cache(directory, hash_name, cache):
     cache_path = Path(directory) / f'.hash_cache_{hash_name}.pkl'
-    with open(cache_path, 'wb') as f:
-        pickle.dump(cache, f)
+    try:
+        if cache_path.exists():
+            os.chmod(cache_path, stat.S_IWRITE)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cache, f)
+    except PermissionError:
+        print(f"⚠️  Warning: Cannot write to {cache_path} (permission denied)")
+        import sys
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error saving hash cache to {cache_path}: {e}")
+        import sys
+        sys.exit(1)
 
 def show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=False):
     import matplotlib.widgets as mwidgets
@@ -214,6 +291,97 @@ def get_filelist_hash(image_files):
     file_info = [(f, os.path.getmtime(f)) for f in image_files]
     return hashlib.sha256(str(sorted(file_info)).encode()).hexdigest()
 
+def ensure_cache_files_writable(directory, hash_name=None):
+    import glob
+    import sys
+    from pathlib import Path
+    import stat
+    cache_files = [
+        Path(directory) / '.groups_cache.pkl',
+        Path(directory) / '.groups_cache.meta',
+        Path(directory) / '.reviewed_groups.pkl',
+        Path(directory) / '.deleted_images.pkl',
+    ]
+    # Add all .hash_cache_*.pkl files
+    cache_files += [Path(f) for f in glob.glob(str(Path(directory) / '.hash_cache_*.pkl'))]
+    # Always include the expected hash cache file
+    hash_cache = None
+    if hash_name:
+        hash_cache = Path(directory) / f'.hash_cache_{hash_name}.pkl'
+        if hash_cache not in cache_files:
+            cache_files.append(hash_cache)
+        # If it doesn't exist, create it empty
+        if not hash_cache.exists():
+            try:
+                with open(hash_cache, 'wb') as f:
+                    import pickle
+                    pickle.dump({}, f)
+                print(f"Created empty hash cache file: {hash_cache}")
+            except Exception as e:
+                print(f"❌ Could not create hash cache file {hash_cache}: {e}")
+                sys.exit(1)
+    for cache_file in cache_files:
+        # Only check files that exist, or the hash cache file (which is always created above)
+        if not cache_file.exists() and (hash_cache is None or cache_file != hash_cache):
+            continue
+        if cache_file.exists():
+            try:
+                # Try opening for append (does not truncate)
+                with open(cache_file, 'ab'):
+                    pass
+            except PermissionError:
+                print(f"Cache file {cache_file} is not writable. Attempting to remove read-only attribute...")
+                try:
+                    os.chmod(cache_file, stat.S_IWRITE)
+                    with open(cache_file, 'ab'):
+                        pass
+                    print(f"Successfully made {cache_file} writable.")
+                except Exception as e:
+                    print(f"Failed to remove read-only attribute with os.chmod: {e}")
+                    # Try using attrib command on Windows
+                    if os.name == 'nt':
+                        import subprocess
+                        try:
+                            subprocess.run(["attrib", "-R", str(cache_file)], check=True)
+                            with open(cache_file, 'ab'):
+                                pass
+                            print(f"Successfully made {cache_file} writable using attrib.")
+                        except Exception as e2:
+                            print(f"❌ Cannot make {cache_file} writable even with attrib: {e2}")
+                    else:
+                        print(f"❌ Cannot make {cache_file} writable: {e}")
+        # Test write and read
+        try:
+            test_data = {'test': 123}
+            import pickle
+            with open(cache_file, 'wb') as f:
+                pickle.dump(test_data, f)
+            with open(cache_file, 'rb') as f:
+                loaded = pickle.load(f)
+            if loaded.get('test') != 123:
+                print(f"❌ Test write/read failed for {cache_file}")
+                # Try to delete the file and log
+                try:
+                    os.remove(cache_file)
+                    print(f"🗑️  Deleted cache file after failed test write/read: {cache_file}")
+                except Exception as del_exc:
+                    print(f"❌ Could not delete {cache_file} after failed test write/read: {del_exc}")
+                sys.exit(1)
+            print(f"Test write/read succeeded for {cache_file}")
+            # Restore empty dict if this is a hash cache
+            if cache_file.name.startswith('.hash_cache_'):
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({}, f)
+        except Exception as e:
+            print(f"❌ Test write/read failed for {cache_file}: {e}")
+            # Try to delete the file and log
+            try:
+                os.remove(cache_file)
+                print(f"🗑️  Deleted cache file after failed test write/read: {cache_file}")
+            except Exception as del_exc:
+                print(f"❌ Could not delete {cache_file} after failed test write/read: {del_exc}")
+            sys.exit(1)
+
 def main():
     parser = argparse.ArgumentParser(description="Interactively find and manage visually similar images in a directory.")
     parser.add_argument("directory", help="Directory containing images")
@@ -223,6 +391,8 @@ def main():
                         help="Hamming distance threshold for similarity (default: 5)")
     parser.add_argument("--auto", action="store_true", help="Automatically approve leftmost image after 7 seconds of no response")
     args = parser.parse_args()
+    # Ensure all cache files are writable before proceeding
+    ensure_cache_files_writable(args.directory, args.hash)
     hash_methods = {
         'phash': imagehash.phash,
         'ahash': imagehash.average_hash,
@@ -238,7 +408,11 @@ def main():
     groups = []
     visited = set()
     # Only use cache for deleted files, not for file list hash
+    start_total = time.time()
+    print(f"Looking for cache file: {GROUPS_CACHE}")
+    cache_start = time.time()
     if GROUPS_CACHE.exists():
+        print(f"Cache file found: {GROUPS_CACHE}. Attempting to load...")
         try:
             with open(GROUPS_CACHE, 'rb') as f:
                 loaded = pickle.load(f)
@@ -247,37 +421,75 @@ def main():
                 else:
                     groups = loaded
                     visited = set()
-        except Exception:
+            print(f"Cache loaded successfully. {len(groups)} groups loaded. (took {time.time() - cache_start:.2f}s)")
+        except Exception as e:
+            print(f"Failed to load cache file: {e} (after {time.time() - cache_start:.2f}s)")
             groups = []
             visited = set()
-        # Prune deleted files from groups and visited
-        current_files = set(image_files)
-        all_group_files = set(img for group in groups for img, _ in group)
-        deleted_files = all_group_files - current_files
-        if deleted_files:
-            new_groups = []
-            for group in groups:
-                new_group = [(img, h) for img, h in group if img in current_files]
-                if len(new_group) > 1:
-                    new_groups.append(new_group)
-            groups = new_groups
-            visited = set(img for img in visited if img in current_files)
+    else:
+        print(f"No cache file found. Will compute groups from scratch. (took {time.time() - cache_start:.2f}s)")
+    # Prune deleted files from groups and visited
+    # Filter out any group that is not a list of (img, hash) tuples
+    def is_valid_group(group):
+        return isinstance(group, (list, tuple)) and all(isinstance(item, (list, tuple)) and len(item) == 2 for item in group)
+    valid_groups = []
+    invalid_group_count = 0
+    for group in groups:
+        if is_valid_group(group):
+            valid_groups.append(group)
+        else:
+            print(f"⚠️  Skipping invalid group in cache: {group}")
+            invalid_group_count += 1
+    if invalid_group_count > 0:
+        print(f"⚠️  {invalid_group_count} invalid group(s) found and skipped in cache.")
+    groups = valid_groups
+    current_files = set(image_files)
+    all_group_files = set(img for group in groups for img, _ in group)
+    deleted_files = all_group_files - current_files
+    if deleted_files:
+        new_groups = []
+        for group in groups:
+            new_group = [(img, h) for img, h in group if img in current_files]
+            if len(new_group) > 1:
+                new_groups.append(new_group)
+        groups = new_groups
+        visited = set(img for img in visited if img in current_files)
+        try:
+            # Remove read-only attribute before writing
+            if GROUPS_CACHE.exists():
+                os.chmod(GROUPS_CACHE, stat.S_IWRITE)
             with open(GROUPS_CACHE, 'wb') as f:
                 pickle.dump((groups, visited), f)
             print(f"Pruned deleted files from cache. {len(groups)} groups remain.")
-        # Invalidate cache only if new files are added
-        cached_files = all_group_files
-        new_files = current_files - cached_files
-        if new_files:
+        except PermissionError:
+            print(f"⚠️  Warning: Cannot write to {GROUPS_CACHE} (permission denied)")
+            # Try to save to a temp directory or user's home directory
+            fallback_path = Path.home() / f".photosort_cache_{GROUPS_CACHE.name}"
+            try:
+                with open(fallback_path, 'wb') as f:
+                    pickle.dump((groups, visited), f)
+                print(f"📁 Cache saved to fallback location: {fallback_path}")
+            except Exception as e:
+                print(f"❌ Failed to save cache to fallback location: {e}")
+    # Invalidate cache only if new files are added
+    cached_files = all_group_files
+    new_files = current_files - cached_files
+    if new_files:
+        if GROUPS_CACHE.exists():
+            os.chmod(GROUPS_CACHE, stat.S_IWRITE)
             GROUPS_CACHE.unlink()
-            print('Detected new files. Regenerating groups cache...')
-            groups = []
-            visited = set()
+        print('Detected new files. Regenerating groups cache...')
+        groups = []
+        visited = set()
+    print(f"Preparing to hash {len(image_files)} images...")
+    hash_start = time.time()
     hash_cache = load_hash_cache(args.directory, args.hash)
     hashes = []
-    for img_path in tqdm(image_files, desc="Hashing images", unit="img"):
-        stat = os.stat(img_path)
-        cache_key = (img_path, stat.st_mtime)
+    for i, img_path in enumerate(tqdm(image_files, desc="Hashing images", unit="img")):
+        if i % 100 == 0 and i > 0:
+            print(f"  Hashed {i} images so far... ({time.time() - hash_start:.2f}s elapsed)")
+        img_stat = os.stat(img_path)
+        cache_key = (img_path, img_stat.st_mtime)
         h = None
         if cache_key in hash_cache:
             h = hash_cache[cache_key]
@@ -288,9 +500,11 @@ def main():
                 save_hash_cache(args.directory, args.hash, hash_cache)
         if h is not None:
             hashes.append((img_path, h))
+    print(f"Hashing complete. ({time.time() - hash_start:.2f}s)")
     # Only group ungrouped images, never regroup all
     grouped_imgs = set(img for group in groups for img, _ in group)
     ungrouped_imgs = [img for img in image_files if img not in grouped_imgs]
+    group_start = time.time()
     if len(ungrouped_imgs) > 1:
         print(f"Grouping {len(ungrouped_imgs)} new/ungrouped images (this may take a while)...")
         ungrouped_hashes = [(img, h) for img, h in hashes if img in ungrouped_imgs]
@@ -320,9 +534,11 @@ def main():
                 groups.append(group)
             with open(GROUPS_CACHE, 'wb') as f:
                 pickle.dump((groups, visited), f)
+        print(f"Grouping complete. ({time.time() - group_start:.2f}s)")
     else:
         print("No new groups to form. All remaining images are singletons.")
     print(f"Found {len(groups)} groups of visually similar images.")
+    review_start = time.time()
     reviewed_cache = load_pickle_cache(REVIEWED_CACHE)
     deleted_cache = load_pickle_cache(DELETED_CACHE)
     deleted_files_log = Path(args.directory) / 'deleted_files.log'
@@ -335,6 +551,9 @@ def main():
             for img_path, _ in group:
                 if img_path != result['target']:
                     try:
+                        # Remove read-only attribute before deleting
+                        if os.path.exists(img_path):
+                            os.chmod(img_path, stat.S_IWRITE)
                         os.remove(img_path)
                         deleted_cache.add(img_path)
                         with open(deleted_files_log, 'a') as dlog:
@@ -347,6 +566,9 @@ def main():
         elif result['action'] == 'delete_all':
             for img_path, _ in group:
                 try:
+                    # Remove read-only attribute before deleting
+                    if os.path.exists(img_path):
+                        os.chmod(img_path, stat.S_IWRITE)
                     os.remove(img_path)
                     deleted_cache.add(img_path)
                     with open(deleted_files_log, 'a') as dlog:
@@ -359,6 +581,8 @@ def main():
             print("Kept all images in this group.")
         else:
             print("No action taken.")
+    print(f"Review loop complete. ({time.time() - review_start:.2f}s)")
+    print(f"Total script time: {time.time() - start_total:.2f}s")
 
 if __name__ == "__main__":
     main()
