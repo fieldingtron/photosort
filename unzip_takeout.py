@@ -12,6 +12,7 @@ from pathlib import Path
 def unzip_file(zip_path, extract_to=None):
     """
     Unzip a single file to the specified directory.
+    Ignores errors for individual files and continues extracting others.
     
     Args:
         zip_path (str): Path to the zip file
@@ -27,10 +28,18 @@ def unzip_file(zip_path, extract_to=None):
             # Get the total number of files for progress tracking
             total_files = len(zip_ref.namelist())
             print(f"  Found {total_files} files in archive")
-            
+            failed_files = []
             # Extract all files
-            zip_ref.extractall(extract_to)
-            print(f"  ✓ Successfully extracted to {extract_to}")
+            for member in zip_ref.namelist():
+                try:
+                    zip_ref.extract(member, extract_to)
+                except Exception as e:
+                    print(f"    ✗ Failed to extract {member}: {e}")
+                    failed_files.append(member)
+            if failed_files:
+                print(f"  ✗ {len(failed_files)} file(s) failed to extract in {zip_path}")
+            else:
+                print(f"  ✓ Successfully extracted to {extract_to}")
             
     except zipfile.BadZipFile:
         print(f"  ✗ Error: {zip_path} is not a valid zip file")
@@ -55,6 +64,37 @@ def find_takeout_zips(directory="."):
     zip_files = glob.glob(pattern, recursive=False)
     return sorted(zip_files)
 
+def test_zip_extraction(zip_path, extract_to=None):
+    """
+    Test if all files in the zip exist in the extraction directory.
+    Returns the number of missing files (0 if all exist).
+    """
+    if extract_to is None:
+        extract_to = os.path.dirname(zip_path)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            missing = []
+            for member in zip_ref.namelist():
+                out_path = os.path.join(extract_to, member)
+                if not os.path.exists(out_path):
+                    missing.append(member)
+            if missing:
+                print(f"  ✗ {zip_path}: {len(missing)} missing files")
+                for m in missing[:10]:
+                    print(f"    - {m}")
+                if len(missing) > 10:
+                    print(f"    ...and {len(missing)-10} more")
+                return len(missing)
+            else:
+                print(f"  ✓ {zip_path}: all files present in {extract_to}")
+                return 0
+    except zipfile.BadZipFile:
+        print(f"  ✗ Error: {zip_path} is not a valid zip file")
+        return -1
+    except Exception as e:
+        print(f"  ✗ Error testing {zip_path}: {str(e)}")
+        return -1
+
 def main():
     parser = argparse.ArgumentParser(description="Unzip all takeout*.zip files")
     parser.add_argument(
@@ -76,7 +116,10 @@ def main():
         action="store_true",
         help="Delete zip files after successful extraction"
     )
-    
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Test that all files in each takeout*.zip exist in the extraction directory, without extracting"
+    )
     args = parser.parse_args()
     
     # Find all takeout zip files
@@ -92,6 +135,30 @@ def main():
     
     if args.list_only:
         return
+    
+    if args.test:
+        print("\nTesting extraction completeness...")
+        all_ok = True
+        total_missing = 0
+        zips_to_extract = []
+        for zip_file in zip_files:
+            missing_count = test_zip_extraction(zip_file, args.extract_to)
+            if missing_count > 0:
+                all_ok = False
+                total_missing += missing_count
+                zips_to_extract.append(zip_file)
+        print("\nTEST SUMMARY")
+        if all_ok:
+            print("All zip files have been fully extracted.")
+            return
+        else:
+            print(f"Some zip files are missing extracted files. Total missing files: {total_missing}")
+            if zips_to_extract:
+                print(f"\nRe-extracting {len(zips_to_extract)} zip file(s) with missing files...")
+                for zip_file in zips_to_extract:
+                    unzip_file(zip_file, args.extract_to)
+                print("\nRe-extraction complete.")
+            return
     
     print("\nStarting extraction...")
     

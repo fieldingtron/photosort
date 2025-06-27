@@ -162,7 +162,7 @@ def save_hash_cache(directory, hash_name, cache):
         import sys
         sys.exit(1)
 
-def show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=False):
+def show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=None):
     import matplotlib.widgets as mwidgets
     import numpy as np
     from matplotlib import pyplot as plt
@@ -269,16 +269,16 @@ def show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=
         elif event.key == 'down':
             delete_all_callback()
     fig.canvas.mpl_connect('key_press_event', on_key)
-    # Auto-approve leftmost after 7 seconds if --auto is set, using matplotlib timer
+    # Auto-approve leftmost after N seconds if auto is set (auto is int seconds)
     def auto_approve(event=None):
         if not action_taken[0]:
             keep_callbacks[0]()
-    if auto:
-        timer = fig.canvas.new_timer(interval=7000)
+    if isinstance(auto, int) and auto > 0:
+        timer = fig.canvas.new_timer(interval=auto * 1000)  # N seconds
         timer.add_callback(auto_approve)
         timer.start()
     plt.show()
-    if auto:
+    if isinstance(auto, int) and auto > 0:
         try:
             timer.stop()
         except Exception:
@@ -382,14 +382,39 @@ def ensure_cache_files_writable(directory, hash_name=None):
                 print(f"❌ Could not delete {cache_file} after failed test write/read: {del_exc}")
             sys.exit(1)
 
+# When moving or keeping images, move from import to primary if needed
+def move_to_primary(img_path, dest_directory):
+        import shutil
+        dest_dir = Path(dest_directory)
+        src_path = Path(img_path)
+        dest_path = dest_dir / src_path.name
+        if src_path.resolve() == dest_path.resolve():
+            return str(dest_path)
+        # Avoid overwriting
+        if dest_path.exists():
+            base, ext = os.path.splitext(dest_path.name)
+            for i in range(1, 10000):
+                candidate = dest_dir / f"{base}_imported_{i}{ext}"
+                if not candidate.exists():
+                    dest_path = candidate
+                    break
+        shutil.move(str(src_path), str(dest_path))
+        print(f"Moved {src_path} to {dest_path}")
+        return str(dest_path)
+
 def main():
     parser = argparse.ArgumentParser(description="Interactively find and manage visually similar images in a directory.")
-    parser.add_argument("directory", help="Directory containing images")
+    parser.add_argument("directory", help="Directory containing images (primary destination)")
     parser.add_argument("--hash", choices=["phash", "ahash", "dhash", "whash"], default="phash",
                         help="Hash function to use (default: phash)")
     parser.add_argument("--threshold", type=int, default=5,
                         help="Hamming distance threshold for similarity (default: 5)")
-    parser.add_argument("--auto", action="store_true", help="Automatically approve leftmost image after 7 seconds of no response")
+    parser.add_argument("--auto", nargs="?", const=10, type=int,
+                        help="Automatically approve leftmost image after N seconds of no response (default: 10s if used without value)")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="If set, automatically choose the leftmost image in each group and delete the others, without showing any window.")
+    parser.add_argument("--import", dest="import_dir", type=str, default=None,
+                        help="Import images from another directory recursively, comparing and moving unique/selected images to the primary directory.")
     args = parser.parse_args()
     # Ensure all cache files are writable before proceeding
     ensure_cache_files_writable(args.directory, args.hash)
@@ -401,7 +426,15 @@ def main():
     }
     hasher = hash_methods.get(args.hash, imagehash.phash)
     exts = {'.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.gif'}
+    # Gather images from both primary and import directories
     image_files = [str(p) for p in Path(args.directory).rglob('*') if p.suffix.lower() in exts and not p.name.startswith('._')]
+    image_sources = {img: 'primary' for img in image_files}
+    if args.import_dir:
+        import_files = [str(p) for p in Path(args.import_dir).rglob('*') if p.suffix.lower() in exts and not p.name.startswith('._')]
+        for img in import_files:
+            if img not in image_sources:
+                image_files.append(img)
+                image_sources[img] = 'import'
     current_hash = get_filelist_hash(image_files)
     GROUPS_CACHE = Path(args.directory) / '.groups_cache.pkl'
     GROUPS_META = Path(args.directory) / '.groups_cache.meta'
@@ -485,6 +518,7 @@ def main():
     hash_start = time.time()
     hash_cache = load_hash_cache(args.directory, args.hash)
     hashes = []
+    hash_cache_updated = False  # Track if cache was updated
     for i, img_path in enumerate(tqdm(image_files, desc="Hashing images", unit="img")):
         if i % 100 == 0 and i > 0:
             print(f"  Hashed {i} images so far... ({time.time() - hash_start:.2f}s elapsed)")
@@ -497,9 +531,16 @@ def main():
             h = compute_hash(img_path, hasher)
             if h is not None:
                 hash_cache[cache_key] = h
-                save_hash_cache(args.directory, args.hash, hash_cache)
+                hash_cache_updated = True
         if h is not None:
             hashes.append((img_path, h))
+        # Save every 100 images if there are updates
+        if i > 0 and i % 100 == 0 and hash_cache_updated:
+            save_hash_cache(args.directory, args.hash, hash_cache)
+            hash_cache_updated = False
+    # Save hash cache only if updated at the end
+    if hash_cache_updated:
+        save_hash_cache(args.directory, args.hash, hash_cache)
     print(f"Hashing complete. ({time.time() - hash_start:.2f}s)")
     # Only group ungrouped images, never regroup all
     grouped_imgs = set(img for group in groups for img, _ in group)
@@ -546,8 +587,24 @@ def main():
         group_id = tuple(sorted(img for img, _ in group))
         if group_id in reviewed_cache:
             continue  # Already reviewed this group
-        result = show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=args.auto)
+        auto_timeout = args.auto if args.auto is not None else None
+        if args.no_gui:
+            # Simulate auto-choose leftmost without window
+            result = {'action': 'keep_one', 'target': group[0][0]}
+            reviewed_cache.add(group_id)
+            save_pickle_cache(REVIEWED_CACHE, reviewed_cache)
+        else:
+            result = show_group_interactive(group, group_id, reviewed_cache, deleted_cache, auto=auto_timeout)
         if result['action'] == 'keep_one':
+            # If the kept image is from import, move it to primary
+            kept = result['target']
+            if image_sources.get(kept) == 'import':
+                new_path = move_to_primary(kept, args.directory)
+                # Update caches and group references
+                result['target'] = new_path
+                image_sources[new_path] = 'primary'
+                image_sources.pop(kept, None)
+                kept = new_path
             for img_path, _ in group:
                 if img_path != result['target']:
                     try:
@@ -581,6 +638,10 @@ def main():
             print("Kept all images in this group.")
         else:
             print("No action taken.")
+    # After all groups, move any unique images from import to primary
+    unique_imports = [img for img in image_files if image_sources.get(img) == 'import' and img not in deleted_cache]
+    for img in unique_imports:
+        move_to_primary(img, args.directory)
     print(f"Review loop complete. ({time.time() - review_start:.2f}s)")
     print(f"Total script time: {time.time() - start_total:.2f}s")
 
